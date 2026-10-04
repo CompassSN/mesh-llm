@@ -86,6 +86,7 @@ class BuildLlamaGeneratorGuardTests(unittest.TestCase):
         deployment_target: str | None = None,
         host_os: str | None = None,
         backend: str = "cpu",
+        skip_nccl: str | None = None,
         extra_args: tuple[str, ...] = (),
     ) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
         directory = tempfile.TemporaryDirectory()
@@ -152,6 +153,8 @@ class BuildLlamaGeneratorGuardTests(unittest.TestCase):
         )
         if deployment_target is not None:
             env["MACOSX_DEPLOYMENT_TARGET"] = deployment_target
+        if skip_nccl is not None:
+            env["LLAMA_STAGE_SKIP_NCCL"] = skip_nccl
         self.build_env = env
         command = ["bash", str(BUILD_SCRIPT), *extra_args]
         if require_existing:
@@ -217,6 +220,41 @@ class BuildLlamaGeneratorGuardTests(unittest.TestCase):
             "cmake-arg=-DGGML_CUDA_GRAPHS=OFF",
             (build / ".mesh-llm-build-stamp").read_text(),
         )
+
+    def test_cuda_nccl_override_reaches_cmake_and_build_stamp(self) -> None:
+        for override in (None, "0", "1", "true"):
+            with self.subTest(override=override):
+                result, build, log = self.run_build(backend="cuda", skip_nccl=override)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                state = "OFF" if override == "1" else "ON"
+                argument = f"-DGGML_CUDA_NCCL={state}"
+                self.assertIn(argument, log.read_text())
+                self.assertIn(
+                    f"cmake-arg={argument}",
+                    (build / ".mesh-llm-build-stamp").read_text(),
+                )
+
+    def test_cuda_nccl_override_can_be_removed_on_cached_build(self) -> None:
+        result, build, log = self.run_build(backend="cuda", skip_nccl="1")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        before = log.read_text()
+        self.build_env.pop("LLAMA_STAGE_SKIP_NCCL")
+        rebuilt = subprocess.run(
+            ["bash", str(BUILD_SCRIPT)], cwd=ROOT, env=self.build_env,
+            capture_output=True, text=True,
+        )
+        self.assertEqual(rebuilt.returncode, 0, rebuilt.stdout + rebuilt.stderr)
+        self.assertIn("-DGGML_CUDA_NCCL=ON", log.read_text()[len(before):])
+        self.assertIn(
+            "cmake-arg=-DGGML_CUDA_NCCL=ON",
+            (build / ".mesh-llm-build-stamp").read_text(),
+        )
+
+    def test_nccl_override_does_not_affect_cpu_build(self) -> None:
+        result, build, log = self.run_build(backend="cpu", skip_nccl="1")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("GGML_CUDA_NCCL", log.read_text())
+        self.assertNotIn("GGML_CUDA_NCCL", (build / ".mesh-llm-build-stamp").read_text())
 
     def test_stale_makefiles_cache_is_cleared_when_ninja_is_selected(self) -> None:
         result, build, log = self.run_build(cache_generator="Unix Makefiles")

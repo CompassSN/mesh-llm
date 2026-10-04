@@ -1,5 +1,5 @@
 use super::model_lifecycle::runtime_model_audit_context;
-use super::startup_retry::is_retryable_split_start_failure;
+use super::startup_retry::{CapacityFallback, SplitStartRetry, split_start_retry_decision};
 use super::status::current_time_unix_ms;
 use super::status::single_quote_shell_arg;
 use super::{
@@ -305,7 +305,7 @@ where
                     local_capacity_bytes: local_capacity,
                     host_ram_offload_gain_bytes,
                 };
-                match split_start_retry_decision(node, err, &fallback).await {
+                match split_start_retry_decision(err, &fallback) {
                     SplitStartRetry::Wait(err_msg) => {
                         let _ = emit_event(OutputEvent::Info {
                             message: format!("Split waiting to retry: {err_msg}"),
@@ -534,53 +534,6 @@ pub(super) async fn startup_register_loaded_runtime(
     payload
 }
 
-/// Why a split start fell back from a local launch, for the decision below.
-struct CapacityFallback<'a> {
-    announced: bool,
-    model_name: &'a str,
-    required_bytes: u64,
-    local_capacity_bytes: u64,
-    host_ram_offload_gain_bytes: u64,
-}
-
-enum SplitStartRetry {
-    /// Keep waiting: a participant can still appear. Carries the message.
-    Wait(String),
-    /// Stop the launch with this error.
-    Stop(anyhow::Error),
-}
-
-/// Whether a failed split start keeps waiting. A capacity fallback that
-/// cannot gather a second participant, with no peer connected or joining,
-/// stops with an actionable error; other failures keep their retry policy.
-async fn split_start_retry_decision(
-    node: &mesh::Node,
-    err: anyhow::Error,
-    fallback: &CapacityFallback<'_>,
-) -> SplitStartRetry {
-    let err_msg = format!("{err:#}");
-    let connected_peers = node.peers().await.len();
-    let pending_join_targets = node.join_targets.lock().await.len();
-    if split_fallback_cannot_gather_peers(
-        fallback.announced,
-        &err_msg,
-        connected_peers,
-        pending_join_targets,
-    ) {
-        return SplitStartRetry::Stop(err.context(no_split_peer_message(
-            fallback.model_name,
-            fallback.required_bytes,
-            fallback.local_capacity_bytes,
-            fallback.host_ram_offload_gain_bytes,
-        )));
-    }
-    if is_retryable_split_start_failure(&err_msg) {
-        SplitStartRetry::Wait(err_msg)
-    } else {
-        SplitStartRetry::Stop(err)
-    }
-}
-
 /// Local capacity a startup launch plans against. A pinned GPU plans on its
 /// own device memory plus the node's RAM-backed share, which is zero unless
 /// the owner opted into host-RAM offload, so pinning honours the same setting
@@ -621,48 +574,6 @@ pub(super) fn host_ram_offload_hint(
     format!(
         "; set gpu.host_ram_offload = true to let this node also count {:.1} GB of system RAM (an order of magnitude slower)",
         gain_bytes as f64 / 1e9
-    )
-}
-
-/// A capacity fallback whose split cannot find a second participant only
-/// keeps waiting when a peer can actually appear: one is connected, or a join
-/// target is recorded and being dialled. Otherwise the node would stay up
-/// without ever serving the model it was asked for.
-pub(super) fn split_fallback_cannot_gather_peers(
-    capacity_fallback: bool,
-    split_error: &str,
-    connected_peers: usize,
-    pending_join_targets: usize,
-) -> bool {
-    capacity_fallback
-        && (split_error.contains("at least two participating nodes")
-            || split_error.contains("at least two stage participants"))
-        && connected_peers == 0
-        && pending_join_targets == 0
-}
-
-pub(super) fn no_split_peer_message(
-    model_name: &str,
-    required_bytes: u64,
-    local_capacity_bytes: u64,
-    host_ram_offload_gain_bytes: u64,
-) -> String {
-    let offload = if host_ram_offload_would_fit(
-        required_bytes,
-        local_capacity_bytes,
-        host_ram_offload_gain_bytes,
-    ) {
-        format!(
-            ", or set gpu.host_ram_offload = true to run it on this node with {:.1} GB of system RAM (an order of magnitude slower)",
-            host_ram_offload_gain_bytes as f64 / 1e9
-        )
-    } else {
-        String::new()
-    };
-    format!(
-        "Model {model_name} needs {:.1} GB but this node plans on {:.1} GB, and no peer is connected or joining to take split stages. Start it on a mesh whose peers can (--join or --auto){offload}",
-        required_bytes as f64 / 1e9,
-        local_capacity_bytes as f64 / 1e9,
     )
 }
 
@@ -1162,10 +1073,7 @@ mod startup_failure_policy_tests {
 
 #[cfg(test)]
 mod capacity_fallback_tests {
-    use super::{
-        StartupPinnedGpuTarget, host_ram_offload_hint, no_split_peer_message,
-        split_fallback_cannot_gather_peers, startup_local_capacity_bytes,
-    };
+    use super::{StartupPinnedGpuTarget, host_ram_offload_hint, startup_local_capacity_bytes};
 
     fn pinned_12gb() -> StartupPinnedGpuTarget {
         StartupPinnedGpuTarget {
@@ -1212,41 +1120,5 @@ mod capacity_fallback_tests {
             host_ram_offload_hint(40_000_000_000, 12_878_610_432, 18_548_836_761),
             ""
         );
-    }
-
-    #[test]
-    fn a_capacity_fallback_without_any_reachable_peer_stops_instead_of_waiting() {
-        let quorum = "split runtime needs at least two participating nodes for m; found 1 eligible";
-        assert!(split_fallback_cannot_gather_peers(true, quorum, 0, 0));
-        // A connected peer or a recorded join target can still bring a stage.
-        assert!(!split_fallback_cannot_gather_peers(true, quorum, 1, 0));
-        assert!(!split_fallback_cannot_gather_peers(true, quorum, 0, 1));
-        // A forced split and unrelated failures keep their existing handling.
-        assert!(!split_fallback_cannot_gather_peers(false, quorum, 0, 0));
-        assert!(!split_fallback_cannot_gather_peers(
-            true,
-            "stage_control_unreachable: connection lost",
-            0,
-            0
-        ));
-    }
-
-    #[test]
-    fn the_no_peer_error_says_what_to_do() {
-        let message =
-            no_split_peer_message("Qwen3-32B", 20_240_000_000, 12_878_610_432, 18_548_836_761);
-        assert!(message.contains("needs 20.2 GB"), "{message}");
-        assert!(message.contains("plans on 12.9 GB"), "{message}");
-        assert!(message.contains("--join or --auto"), "{message}");
-        assert!(message.contains("gpu.host_ram_offload = true"), "{message}");
-
-        let cpu_only = no_split_peer_message("Qwen3-32B", 20_240_000_000, 16_000_000_000, 0);
-        assert!(!cpu_only.contains("host_ram_offload"), "{cpu_only}");
-
-        // 31.4 GB with offload still falls short of 40 GB: only peers can help.
-        let too_large =
-            no_split_peer_message("Llama-70B", 40_000_000_000, 12_878_610_432, 18_548_836_761);
-        assert!(too_large.contains("--join or --auto"), "{too_large}");
-        assert!(!too_large.contains("host_ram_offload"), "{too_large}");
     }
 }

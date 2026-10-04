@@ -300,6 +300,12 @@ case "$LLAMA_BACKEND" in
     # workload while updating the captured graph. Keep staged runtimes on the
     # ordinary CUDA execution path until that upstream path is safe again.
     CMAKE_ARGS+=(-DGGML_CUDA=ON -DGGML_CUDA_GRAPHS=OFF)
+    # Set both states explicitly so a cached NCCL choice cannot outlive the override.
+    if [[ "${LLAMA_STAGE_SKIP_NCCL:-0}" == "1" ]]; then
+      CMAKE_ARGS+=(-DGGML_CUDA_NCCL=OFF)
+    else
+      CMAKE_ARGS+=(-DGGML_CUDA_NCCL=ON)
+    fi
     if [[ -n "${CUDACXX:-}" ]]; then
       CMAKE_ARGS+=(-DCMAKE_CUDA_COMPILER="$CUDACXX")
     fi
